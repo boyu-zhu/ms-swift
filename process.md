@@ -18,8 +18,8 @@ aws s3 cp s3://orby-ucd/data/FakeTT_DATA_OPENSOURCE.zip .
 unzip FakeTT_DATA_OPENSOURCE.zip
 mv video fakett
 
-pip install -e .
-pip install "deepspeed" -U
-pip install qwen_vl_utils qwen_omni_utils decord librosa icecream soundfile -U
-pip install torchvision
+uv pip install -e .
+uv pip install "deepspeed" -U
+uv pip install qwen_vl_utils qwen_omni_utils decord librosa icecream soundfile -U
+uv pip install torchvision
 uv pip install flash-attn --no-build-isolation
