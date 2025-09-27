@@ -10,16 +10,20 @@ FPS_MAX_FRAMES=12 \
 MAX_PIXELS=1003520 \
 uv run swift sft \
     --model Qwen/Qwen2.5-Omni-7B \
-    --dataset '/root/omni_guardrail/beaver/beaver_w_gt_sft.jsonl' \
-                '/root/omni_guardrail/toxic/toxic_w_gt_sft.jsonl' \
-                '/root/omni_guardrail/wild/wildguardmix_w_gt_sft.jsonl' \
-                '/root/omni_guardrail/aegis/Aegis_w_gt_sft.jsonl' \
+    --dataset '/root/ms-swift/data/text_ready_sft_data/Aegis_w_gt_sft.jsonl' \
+                '/root/ms-swift/data/text_ready_sft_data/beaver_w_gt_sft.jsonl' \
+                '/root/ms-swift/data/text_ready_sft_data/toxic_w_gt_sft.jsonl' \
+                '/root/ms-swift/data/text_ready_sft_data/wildguardmix_w_gt_sft.jsonl' \
+                '/root/omni_guardrail/output/sft/llavaguard_sft.jsonl' \
+                '/root/omni_guardrail/output/sft/unsafebench_sft.jsonl' \
+                '/root/omni_guardrail/output/sft/vlguard_sft.jsonl' \
+                '/root/omni_guardrail/output/sft/vlsbench_sft.jsonl' \
     --split_dataset_ratio 0.01 \
     --train_type full \
     --attn_impl flash_attn \
     --packing true \
     --num_train_epochs 3 \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 1 \
     --learning_rate 1e-4 \
     --freeze_vit true \
@@ -33,6 +37,6 @@ uv run swift sft \
     --warmup_ratio 0.05 \
     --dataloader_num_workers 16 \
     --dataset_num_proc 128 \
-    --deepspeed zero3 \
+    --deepspeed zero2 \
     --use_hf true
 
