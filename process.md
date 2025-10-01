@@ -21,5 +21,6 @@ mv video fakett
 uv pip install -e .
 uv pip install "deepspeed" -U
 uv pip install qwen_vl_utils qwen_omni_utils decord librosa icecream soundfile -U
+uv pip install boto3 gdown
 uv pip install torchvision
 uv pip install flash-attn --no-build-isolation

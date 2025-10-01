@@ -2,22 +2,19 @@
 # Multimodal packing currently only supports qwen2_vl, qwen2_5_vl, qwen2_5_omni, internvl2_5/3
 # A demo for four modalities that can be run directly
 # For local datasets, it is recommended to use streaming: `--streaming true` (save memory)
-NPROC_PER_NODE=8 \
+NPROC_PER_NODE=7 \
 ENABLE_AUDIO_OUTPUT=0 \
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 \
 VIDEO_MAX_PIXELS=50176 \
 FPS_MAX_FRAMES=12 \
 MAX_PIXELS=1003520 \
 uv run swift sft \
     --model Qwen/Qwen2.5-Omni-7B \
-    --dataset '/root/ms-swift/data/text_ready_sft_data/Aegis_w_gt_sft.jsonl' \
-                '/root/ms-swift/data/text_ready_sft_data/beaver_w_gt_sft.jsonl' \
-                '/root/ms-swift/data/text_ready_sft_data/toxic_w_gt_sft.jsonl' \
-                '/root/ms-swift/data/text_ready_sft_data/wildguardmix_w_gt_sft.jsonl' \
-                '/root/omni_guardrail/output/sft/llavaguard_sft.jsonl' \
-                '/root/omni_guardrail/output/sft/unsafebench_sft.jsonl' \
-                '/root/omni_guardrail/output/sft/vlguard_sft.jsonl' \
-                '/root/omni_guardrail/output/sft/vlsbench_sft.jsonl' \
+    --dataset \
+                '/ms-swift/data/text_ready_sft_data/Aegis_w_gt_sft.jsonl' \
+                '/ms-swift/data/text_ready_sft_data/beaver_w_gt_sft.jsonl' \
+                '/ms-swift/data/text_ready_sft_data/toxic_w_gt_sft.jsonl' \
+                '/ms-swift/data/text_ready_sft_data/wildguardmix_w_gt_sft.jsonl' \
     --split_dataset_ratio 0.01 \
     --train_type full \
     --attn_impl flash_attn \
@@ -33,7 +30,7 @@ uv run swift sft \
     --save_total_limit 2 \
     --logging_steps 5 \
     --max_length 4096 \
-    --output_dir output/w_gt \
+    --output_dir output/text_only \
     --warmup_ratio 0.05 \
     --dataloader_num_workers 16 \
     --dataset_num_proc 128 \
