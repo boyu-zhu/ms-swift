@@ -1,6 +1,6 @@
 import zipfile
 from huggingface_hub import hf_hub_download
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 import os
 from tqdm import tqdm
 import requests
@@ -67,7 +67,7 @@ def prepare_vlguard():
     print("解压完成:", extract_dir)
 
 def prepare_vlsbench():
-    dataset = load_dataset("Foreshhh/vlsbench", split='train')
+    dataset = load_dataset("Foreshhh/vlsbench", split='train', token=HF_TOKEN)
     for item in dataset:
         image = item.get("image")
         path = item.get("image_path")
@@ -202,7 +202,35 @@ def prepare_tocix_chat_audio():
         print(f"Tar file not found: {tar_path}")
 
 
-
+def prepare_fakesv():
+    # 要下载的文件 ID 和输出文件名
+    drive_files = [
+        ("1-W_QHoKczSB-DJ4YzkO35PBK9uSEG1dL", "complete.jsonl"),
+        ("1-Wfru9llIW8EloZ5RHoOuTjVKQAOpvkr", "videos.zip")
+    ]
+    
+    # 下载目录
+    download_dir = "./downloads"
+    os.makedirs(download_dir, exist_ok=True)
+    
+    for file_id, filename in drive_files:
+        output_path = os.path.join(download_dir, filename)
+        # 如果文件已存在就跳过下载
+        if os.path.exists(output_path):
+            print(f"⚡ 已存在，跳过下载：{output_path}")
+        else:
+            print(f"⬇ 正在下载 {filename} …")
+            # fuzzy=True 让 gdown 能解析标准分享链接
+            gdown.download(id=file_id, output=output_path, fuzzy=True)
+        
+        # 如果是 zip 文件，就解压
+        if filename.lower().endswith(".zip"):
+            extract_to = "./data/fakesv"
+            os.makedirs(extract_to, exist_ok=True)
+            print(f"📦 解压 {filename} 到 {extract_to}")
+            with zipfile.ZipFile(output_path, 'r') as zf:
+                zf.extractall(extract_to)
+            print(f"✅ 解压完成：{extract_to}")
 
 
 
@@ -215,13 +243,14 @@ def main(mode):
         prepare_vlguard()
         prepare_vlsbench()
         prepare_llavaguard()
-        prepare_safesora()
+        pre()
     if mode in ('text', 'all'):
         print("=== Preparing text datasets ===")
         prepare_text_datasets()
     if mode in ('video', 'all'):
         print("=== Preparing image datasets ===")
-        prepare_safesora()
+        # prepare_safesora()
+        prepare_fakesv()
     if mode in ('audio', 'all'):
         print("=== Preparing image datasets ===")
         prepare_tocix_chat_audio()
