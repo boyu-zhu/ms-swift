@@ -11,7 +11,7 @@ def sanitize(s):
     s = re.sub(r"[^\w\-\.]", "", s)
     return s[:60]
 
-output_dir = "/root/ms-swift/data/unsafebench"
+output_dir = "/ms-swift/data/unsafebench/train"
 os.makedirs(output_dir, exist_ok=True)
 
 # 1) 加载数据
