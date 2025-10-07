@@ -36,6 +36,7 @@ class TrainArgumentsMixin:
     logging_steps: int = 5
     router_aux_loss_coef: float = 0.
     enable_dft_loss: bool = False  # https://arxiv.org/abs/2508.05629
+    enable_channel_loss: bool = False
 
     weight_decay: float = 0.1
     adam_beta2: float = 0.95
@@ -55,7 +56,6 @@ class TrainArgumentsMixin:
     aligner_lr: Optional[float] = None
     vit_lr: Optional[float] = None
     use_logits_to_keep: Optional[bool] = None
-    channels: List[str] = None
     ds3_gather_for_generation: bool = True
     resume_only_model: bool = False
 
@@ -137,6 +137,15 @@ class TrainArgumentsMixin:
 class RLHFArgumentsMixin:
     # gkd
     sft_alpha: float = 0
+    # chord
+    chord_sft_dataset: List[str] = field(default_factory=list)
+    chord_sft_per_device_train_batch_size: Optional[int] = None
+
+    chord_enable_phi_function: bool = False
+    chord_mu_warmup_steps: Optional[int] = None
+    chord_mu_decay_steps: Optional[int] = None
+    chord_mu_peak: Optional[float] = None
+    chord_mu_valley: Optional[float] = None
 
 
 @dataclass
@@ -145,6 +154,9 @@ class SwiftArgumentsMixin(RLHFArgumentsMixin, TrainArgumentsMixin):
     train_type: Optional[str] = None
     local_repo_path: Optional[str] = None
     galore_config: Optional[GaLoreConfig] = None
+    padding_side: Optional[str] = None
+    padding_free: Optional[bool] = None
+    task_type: Optional[str] = None
 
     def __post_init__(self):
         if hasattr(self, 'output_dir'):
@@ -187,6 +199,7 @@ class VllmArguments:
     vllm_use_async_engine: bool = False
     vllm_quantization: Optional[str] = None
     vllm_reasoning_parser: Optional[str] = None
+    vllm_disable_cascade_attn: bool = False
     # rollout
     vllm_data_parallel_size: int = 1
 
@@ -237,9 +250,12 @@ class VllmArguments:
             'use_async_engine': self.vllm_use_async_engine,
             'quantization': self.vllm_quantization,
             'reasoning_parser': self.vllm_reasoning_parser,
+            'disable_cascade_attn': self.vllm_disable_cascade_attn,
+            'num_labels': self.num_labels,
         }
-        if self.task_type == 'embedding':
-            kwargs['task_type'] = 'embedding'
+        if self.task_type in ('embedding', 'seq_cls') or 'reranker' in self.task_type:
+            kwargs['task_type'] = self.task_type
+
         return kwargs
 
 
@@ -295,6 +311,7 @@ class GRPOArgumentsMixin(VllmArguments):
     multi_turn_scheduler: Optional[str] = None
     max_turns: Optional[int] = None
     completion_length_limit_scope: Literal['total', 'per_round'] = 'per_round'
+    vllm_server_pass_dataset: bool = False
 
     # DAPO, https://arxiv.org/abs/2503.14476
     dynamic_sample: bool = False

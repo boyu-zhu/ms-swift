@@ -12,6 +12,15 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from transformers.utils import strtobool
 
 
+def cross_entropy_loss_func(outputs, labels, num_items_in_batch=None, **kwargs):
+    # You need to return a scalar representing the loss.
+    from swift.trainers import per_token_loss_func
+    token_loss = per_token_loss_func(outputs, labels)
+    if num_items_in_batch is None:
+        num_items_in_batch = (labels[:, 1:] != -100).sum()
+    return token_loss.sum() / num_items_in_batch
+
+
 def _parse_pair_sentence(outputs):
     if isinstance(outputs, dict):
         last_hidden_state = outputs['last_hidden_state']
@@ -425,48 +434,6 @@ def online_contrastive_loss(outputs, labels, loss_scale=None, num_items_in_batch
     return loss
 
 
-def channel_loss_func(outputs,
-                      labels,
-                      num_items_in_batch=None,
-                      sample_channels=None,
-                      trainer=None,
-                      position_ids=None,
-                      **kwargs) -> torch.Tensor:
-    from swift.trainers import per_token_loss_func
-    channels = trainer.args.channels
-    assert channels is not None, 'Please pass --channels as a hyperparameter.'
-    assert sample_channels is not None, 'Data does not have channel field.'
-
-    if outputs.loss is None:
-        outputs.loss = per_token_loss_func(outputs, labels)
-    token_loss = outputs.loss
-    masks = torch.roll(labels, shifts=-1, dims=-1).view(-1) != -100
-    if num_items_in_batch is None:
-        num_items_in_batch = masks.sum()
-    loss = token_loss.sum() / num_items_in_batch
-
-    if position_ids is not None and trainer.template.padding_free:
-        start_idx_mask = position_ids.view(-1).eq(0).int()
-        sample_idx = (torch.cumsum(start_idx_mask, dim=0) - 1).tolist()
-        token_channels = [sample_channels[i] for i in sample_idx]
-    else:
-        bs, seq = labels.shape
-        token_channels = []
-        for i in range(bs):
-            token_channels.extend([sample_channels[i]] * seq)
-
-    mode = 'train' if trainer.model.training else 'eval'
-    metrics = trainer.custom_metrics[mode]
-    for ch in set(sample_channels):
-        indices = [i for i, c in enumerate(token_channels) if c == ch]
-        if not indices:
-            continue
-        ch_loss = token_loss[indices][masks[indices]]
-        metrics[f'loss_{ch}'].update(ch_loss)
-
-    return loss
-
-
 def reranker_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
     logits = outputs.logits
     logits = logits.squeeze(1)
@@ -685,12 +652,7 @@ def listwise_generative_reranker_loss(outputs,
     negative_logits = logits[:, -1, negative_token_id]  # [batch_size]
 
     # Create binary classification logits for each sample
-    # Shape: [batch_size, 2] where dim=1 represents [negative, positive]
-    binary_logits = torch.stack([negative_logits, positive_logits], dim=1)
-
-    # Convert to relevance scores using softmax (probability of positive class)
-    binary_probs = torch.softmax(binary_logits, dim=1)
-    relevance_scores = binary_probs[:, 1]  # Probability of positive class [batch_size]
+    logits = positive_logits - negative_logits
 
     # Find positive sample indices to determine group boundaries
     positive_indices = torch.nonzero(labels == 1, as_tuple=False).squeeze(-1)
@@ -717,7 +679,7 @@ def listwise_generative_reranker_loss(outputs,
             group_end = len(labels)
 
         # Extract group relevance scores and labels
-        group_scores = relevance_scores[group_start:group_end]  # [group_size]
+        group_scores = logits[group_start:group_end]  # [group_size]
         group_labels = labels[group_start:group_end]  # [group_size]
 
         # Skip groups that are too small
@@ -728,9 +690,7 @@ def listwise_generative_reranker_loss(outputs,
         if group_labels[0] != 1:
             continue  # Skip malformed groups
 
-        # Convert relevance scores to logits for cross-entropy loss
-        # We use log to convert probabilities back to logits, then apply temperature
-        group_logits = torch.log(group_scores + 1e-8) / temperature  # Add small epsilon for numerical stability
+        group_logits = group_scores / temperature
 
         # The positive document is always at index 0 within the group
         target = torch.tensor(0, dtype=torch.long, device=logits.device)
@@ -750,7 +710,7 @@ def listwise_generative_reranker_loss(outputs,
 
 
 loss_mapping = {
-    'channel_loss': channel_loss_func,
+    'cross_entropy': cross_entropy_loss_func,  # examples
     # embedding
     'cosine_similarity': cosine_similarity_func,
     'contrastive': contrastive_loss,

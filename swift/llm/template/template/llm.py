@@ -33,9 +33,37 @@ register_template(
         default_system=DEFAULT_SYSTEM,
     ))
 
-register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_gme, template_cls=Qwen2VLTemplate, suffix=['<|endoftext|>']))
+
+class GMETemplate(Qwen2VLTemplate):
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        super()._preprocess_inputs(inputs)
+        if inputs.messages[-1]['role'] != 'assistant':
+            inputs.messages.append({'role': 'assistant', 'content': ''})
+        return inputs
+
+
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_gme, template_cls=GMETemplate, suffix=['<|endoftext|>']))
+
+
+class Qwen3EmbTemplate(Template):
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        super()._preprocess_inputs(inputs)
+        if inputs.system is not None:
+            inputs.messages[0]['content'] = inputs.system + ' ' + inputs.messages[0]['content']
+            inputs.system = None
+        return inputs
+
+
 register_template(
-    TemplateMeta(LLMTemplateType.qwen3_emb, suffix=['<|endoftext|>'], prefix=[], chat_sep=[], prompt=['{{QUERY}}']))
+    TemplateMeta(
+        LLMTemplateType.qwen3_emb,
+        template_cls=Qwen3EmbTemplate,
+        suffix=['<|endoftext|>'],
+        prefix=[],
+        chat_sep=[],
+        prompt=['{{QUERY}}']))
 
 register_template(
     TemplateMeta(LLMTemplateType.baichuan, prefix=['{{SYSTEM}}'], prompt=[[195], '{{QUERY}}', [196]], chat_sep=[]))
@@ -338,12 +366,43 @@ class GptTemplate(Template):
                     message['content'] = '<|channel|>final<|message|>' + message['content']
 
 
+@dataclass
+class GptOssTemplateMeta(TemplateMeta):
+    prefix: Prompt = field(default_factory=lambda: ['{{SYSTEM}}'])
+    prompt: Prompt = field(default_factory=lambda: ['<|start|>user<|message|>{{QUERY}}<|end|><|start|>assistant'])
+    chat_sep: Optional[Prompt] = field(default_factory=lambda: ['<|end|>'])
+    suffix: Prompt = field(default_factory=lambda: ['<|return|>'])
+
+
+register_template(GptOssTemplateMeta(LLMTemplateType.gpt_oss, template_cls=GptTemplate))
+
 register_template(
     TemplateMeta(
-        LLMTemplateType.gpt_oss,
-        prefix=['{{SYSTEM}}'],
-        prompt=['<|start|>user<|message|>{{QUERY}}<|end|><|start|>assistant'],
-        chat_sep=['<|end|>'],
-        suffix=['<|return|>'],
-        template_cls=GptTemplate,
+        LLMTemplateType.longchat,
+        prefix=[],
+        system_prefix=['SYSTEM:{{SYSTEM}}'],
+        prompt=[' [Round {{ROUND0}}] USER:{{QUERY}} ASSISTANT:'],
+        chat_sep=['</longcat_s>'],
+        suffix=['</longcat_s>'],
+    ))
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.ling2,
+        prefix=['<role>SYSTEM</role>detailed thinking off<|role_end|>'],
+        system_prefix=['<role>SYSTEM</role>{{SYSTEM}}\ndetailed thinking off<|role_end|>'],
+        prompt=['<role>HUMAN</role>{{QUERY}}<|role_end|><role>ASSISTANT</role>'],
+        chat_sep=['<|role_end|>'],
+        suffix=['<|role_end|>'],
+    ))
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.ring2,
+        prefix=[],
+        system_prefix=['<role>SYSTEM</role>{{SYSTEM}}'],
+        prompt=['<role>HUMAN</role>{{QUERY}}<role>ASSISTANT</role>'],
+        chat_sep=[],
+        suffix=['<|endoftext|>'],
+        response_prefix='<think>\n',
     ))

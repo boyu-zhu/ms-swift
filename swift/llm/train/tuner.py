@@ -79,6 +79,8 @@ def get_multimodal_target_regex(
 
         sub_module = deep_getattr(model, module)
         target_modules = find_all_linears(sub_module, model_arch, extra_layers)
+        if not target_modules:
+            continue
         target_modules = [tm for tm in target_modules if tm]
         target_pattern = rf'.*\.({"|".join(target_modules)})' if target_modules else ''
         rejected_pattern = rf'(?!({"|".join(rejected_modules)}))' if rejected_modules else ''
@@ -383,9 +385,4 @@ class TunerMixin:
                 queue_size=args.galore_queue_size,
             )
             args.training_args.galore_config = args.galore_config
-
-        if args.sequence_parallel_size > 1:
-            from swift.trainers.sequence_parallel import sequence_parallel
-            sequence_parallel.prepare_model(model, template.tokenizer)
-
         return model

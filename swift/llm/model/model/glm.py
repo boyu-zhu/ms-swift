@@ -432,6 +432,9 @@ register_model(
                 Model('ZhipuAI/GLM-4.5', 'zai-org/GLM-4.5'),
                 Model('ZhipuAI/GLM-4.5-FP8', 'zai-org/GLM-4.5-FP8'),
             ]),
+            ModelGroup([
+                Model('ZhipuAI/GLM-4.6', 'zai-org/GLM-4.6'),
+            ])
         ],
         TemplateType.glm4_5,
         get_model_tokenizer_with_flash_attn,
@@ -443,7 +446,10 @@ register_model(
 def get_model_tokenizer_glm4_5v(*args, **kwargs):
     from transformers import Glm4vMoeForConditionalGeneration
     kwargs['automodel_class'] = kwargs['automodel_class'] or Glm4vMoeForConditionalGeneration
-    return get_model_tokenizer_multimodal(*args, **kwargs)
+    model, processor = get_model_tokenizer_multimodal(*args, **kwargs)
+    if model is not None:
+        patch_get_input_embeddings(model.visual, 'patch_embed')
+    return model, processor
 
 
 register_model(

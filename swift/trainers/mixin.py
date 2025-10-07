@@ -15,6 +15,7 @@ from functools import partial, wraps
 from types import MethodType
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import datasets
 import numpy as np
 import safetensors
 import torch
@@ -33,15 +34,16 @@ from transformers.data.data_collator import DataCollator
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
 from transformers.trainer import (OPTIMIZER_NAME, PREFIX_CHECKPOINT_DIR, SCHEDULER_NAME, TRAINER_STATE_NAME,
-                                  ParallelMode, TrainerCallback, reissue_pt_warnings)
+                                  ParallelMode, Trainer, TrainerCallback, reissue_pt_warnings)
 from transformers.trainer_utils import IntervalStrategy
 
 from swift.hub import get_hub
-from swift.llm import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard, Template
+from swift.llm import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard, Template, get_llm_model
 from swift.llm.utils import update_generation_config_eos_token
 from swift.plugin import MeanMetric, compute_acc, extra_tuners, get_loss_func, get_metric
 from swift.tuners import SwiftModel
-from swift.utils import get_logger, is_dist, is_mp, is_mp_ddp, ms_logger_context, seed_worker
+from swift.utils import get_current_device, get_logger, is_dist, is_mp, is_mp_ddp, ms_logger_context, seed_worker
+from ..llm.model.patcher import get_lm_head_model, revert_padding_free, transformers_seq_cls_forward
 from .arguments import TrainingArguments
 from .utils import can_return_loss, find_labels, get_function, is_instance_of_ms_model
 
@@ -100,6 +102,9 @@ class SwiftMixin:
         self.model_meta = model.model_meta
 
         kwargs.update(self.create_loss_and_metric(args))
+        trainer_parameters = inspect.signature(Trainer.__init__).parameters
+        tokenizer_key = 'processing_class' if 'processing_class' in trainer_parameters else 'tokenizer'
+        kwargs[tokenizer_key] = template.tokenizer
         with self.hub.patch_hub():
             super().__init__(
                 model=model,
@@ -107,7 +112,6 @@ class SwiftMixin:
                 data_collator=data_collator,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
-                tokenizer=template.tokenizer,
                 model_init=model_init,
                 callbacks=callbacks,
                 optimizers=optimizers,
@@ -118,10 +122,8 @@ class SwiftMixin:
             self.can_return_loss = can_return_loss(model)
         self.label_names = self.label_names or ['labels']
         self.start_time = time.time()
-        if self.template.sequence_parallel_size > 1:
-            from swift.trainers.sequence_parallel import sequence_parallel
-            sequence_parallel.prepare_trainer(self)
         self._fix_gradient_checkpointing()
+        self._patch_tasks()
         update_generation_config_eos_token(self.model.generation_config, self.template)
         if getattr(self.model, 'origin_generation_config', None):
             self.model.origin_generation_config.eos_token_id = self.model.generation_config.eos_token_id
@@ -129,6 +131,11 @@ class SwiftMixin:
             # The weights have already been loaded outside the trainer,
             # so reading train_state is skipped here.
             self.args.resume_from_checkpoint = None
+
+    @property
+    def tokenizer(self):
+        # compat transformers5.0
+        return self.processing_class
 
     @contextmanager
     def _patch_deepspeed_load_checkpoint(self):
@@ -586,6 +593,92 @@ class SwiftMixin:
         finally:
             Accelerator.clip_grad_norm_ = origin_clip_grad_norm_
 
+    def _patch_tasks(self):
+        if isinstance(self.model, PeftModel):
+            model = self.model.model
+        else:
+            model = self.model
+        if 'SentenceTransformer' in model.__class__.__name__:
+
+            def forward_transformer(transformer, features: Dict[str, torch.Tensor],
+                                    **kwargs) -> Dict[str, torch.Tensor]:
+                trans_features = {
+                    key: value
+                    for key, value in features.items()
+                    if key in ['input_ids', 'attention_mask', 'token_type_ids', 'inputs_embeds', 'position_ids']
+                }
+
+                outputs = transformer.auto_model(**trans_features, **kwargs, return_dict=True)
+                token_embeddings = outputs[0]
+                features['token_embeddings'] = token_embeddings
+
+                if transformer.auto_model.config.output_hidden_states and 'hidden_states' in outputs:
+                    features['all_layer_embeddings'] = outputs['hidden_states']
+
+                return features
+
+            from sentence_transformers.models import Transformer
+            if isinstance(model[0], Transformer):
+                model[0].forward = MethodType(forward_transformer, model[0])
+
+            def forward_sentence_transformer(sentence_transformer, **kwargs) -> Dict[str, torch.Tensor]:
+                input = kwargs
+                kwargs = {}
+                for idx, (module_name, module) in enumerate(sentence_transformer.named_children()):
+                    from sentence_transformers.models import Router
+                    if isinstance(module, Router):
+                        module_kwargs = kwargs
+                    else:
+                        module_kwarg_keys = []
+                        if sentence_transformer.module_kwargs is not None:
+                            module_kwarg_keys = sentence_transformer.module_kwargs.get(module_name, [])
+                        module_kwargs = {
+                            key: value
+                            for key, value in kwargs.items() if key in module_kwarg_keys or (
+                                hasattr(module, 'forward_kwargs') and key in module.forward_kwargs)
+                        }
+                    output = module(input, **module_kwargs)
+                    if idx == 0 and self.args.padding_free:
+                        output = revert_padding_free(output, input, self.args.padding_side)
+                    input = output
+                return {'last_hidden_state': input['sentence_embedding']}
+
+            model.forward = MethodType(forward_sentence_transformer, model)
+        elif self.args.padding_free:
+            if self.args.task_type == 'embedding':
+                llm_model = get_lm_head_model(self.model, model_meta=self.model.model_meta)
+
+                def revert_padding_free_hook(module, args, input, output):
+                    return revert_padding_free(output, input, self.args.padding_side)
+
+                llm_model.register_forward_hook(revert_padding_free_hook, with_kwargs=True, prepend=True)
+            elif self.args.task_type == 'seq_cls':
+                llm_model = get_llm_model(self.model, model_meta=self.model.model_meta)
+
+                def seq_cls_forward(model, **kwargs):
+
+                    def inner_forward(**kwargs):
+                        output = llm_model.forward(**kwargs)
+                        return revert_padding_free(output, kwargs, self.args.padding_side)
+
+                    return transformers_seq_cls_forward(model, origin_forward=inner_forward, **kwargs)
+
+                model.forward = MethodType(seq_cls_forward, model)
+            elif self.args.task_type == 'reranker':
+                llm_model = get_llm_model(self.model, model_meta=self.model.model_meta)
+
+                def revert_padding_free_hook(module, args, input, output):
+                    return revert_padding_free(output, input, self.args.padding_side)
+
+                llm_model.register_forward_hook(revert_padding_free_hook, with_kwargs=True, prepend=True)
+            elif self.args.task_type == 'generative_reranker':
+                llm_model = get_llm_model(self.model, model_meta=self.model.model_meta)
+
+                def revert_padding_free_hook(module, args, input, output):
+                    return revert_padding_free(output, input, self.args.padding_side)
+
+                llm_model.register_forward_hook(revert_padding_free_hook, with_kwargs=True, prepend=True)
+
     def _fix_gradient_checkpointing(self):
         # fix use_reentrant
         if hasattr(torch.utils.checkpoint, '_old_checkpoint'):  # avoid double patching
@@ -682,11 +775,19 @@ class SwiftMixin:
         with self.hub.patch_hub():
             return super().push_to_hub(*args, **kwargs)
 
-    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
-        mode = 'train' if self.model.training else 'eval'
-        for k, metric in self.custom_metrics[mode].items():
-            if mode == 'eval':
-                k = f'eval_{k}'
+    @staticmethod
+    def compute_custom_metrics(metrics, key_prefix: str = ''):
+        logs = {}
+        # Synchronize keys to avoid getting stuck.
+        if dist.is_initialized():
+            all_keys = [None] * dist.get_world_size()
+            dist.all_gather_object(all_keys, list(metrics.keys()))
+            for key in set().union(*all_keys):
+                if key not in metrics:
+                    metrics[key]
+
+        for k, metric in sorted(metrics.items()):
+            k = f'{key_prefix}{k}'
             value = metric.compute()
             metric.reset()
             if isinstance(value, dict):
@@ -702,6 +803,13 @@ class SwiftMixin:
         for k in list(logs.keys()):
             if logs[k] is None:
                 logs.pop(k)
+        return logs
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        mode = 'train' if self.model.training else 'eval'
+        metrics = self.custom_metrics[mode]
+        prefix = 'eval_' if mode == 'eval' else ''
+        logs.update(self.compute_custom_metrics(metrics, prefix))
         return super().log(logs, *args, **kwargs)
 
     def _maybe_log_save_evaluate(self, tr_loss, *args, **kwargs):
@@ -724,7 +832,11 @@ class SwiftMixin:
             self.log(logs)
 
         if self.args.eval_use_evalscope and self.control.should_evaluate:
-            self._evalscope_eval()
+            try:
+                self._evalscope_eval()
+            except Exception as e:
+                logger.warning(f'Failed to call EvalScope evaluation function: {e}.')
+
             if not self.eval_dataset:
                 self.control.should_evaluate = False
         super()._maybe_log_save_evaluate(tr_loss, *args, **kwargs)
@@ -752,6 +864,27 @@ class SwiftMixin:
     def _compute_acc(self, outputs, labels) -> None:
         args = self.args
         preds = outputs.logits.argmax(dim=-1)
+        if self.template.sequence_parallel_size > 1:
+            from swift.trainers.sequence_parallel import sequence_parallel
+            # Gather preds and labels across the sp group
+            if isinstance(preds, np.ndarray):
+                preds = torch.from_numpy(preds).to(get_current_device())
+            if isinstance(labels, np.ndarray):
+                labels = torch.from_numpy(labels).to(get_current_device())
+            assert labels.shape[1] == preds.shape[1]
+
+            if sequence_parallel.rp_world_size > 1:
+                position_ids = sequence_parallel.real_position_ids
+                position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
+            else:
+                position_ids = None
+            preds_output = sequence_parallel.gather(preds, dim=1, position_ids=position_ids)
+            labels_output = sequence_parallel.gather(labels, dim=1, position_ids=position_ids)
+            # roll back to fit compute_acc
+            labels_output = torch.roll(labels_output, shifts=1, dims=1)
+            preds = preds_output
+            labels = labels_output.int()
+
         metrics = compute_acc(
             preds, labels, acc_strategy=args.acc_strategy, is_encoder_decoder=self.template.is_encoder_decoder)
         mode = 'train' if self.model.training else 'eval'
@@ -762,20 +895,22 @@ class SwiftMixin:
     def _evalscope_eval(self):
         from ..llm.eval.utils import EvalModel
         from evalscope import TaskConfig, run_task
-        from evalscope.constants import EvalType
 
         self.model.eval()
-        max_batch_size = self.args.per_device_eval_batch_size
-        custom_model = EvalModel(
-            self.model, self.template, max_batch_size=max_batch_size, model_name=f'model-step{self.state.global_step}')
+        # prepare task config
         task_config_kwargs = dict(
-            model=custom_model,
-            eval_type=EvalType.CUSTOM,
+            model=EvalModel(
+                model_name=f'model-step{self.state.global_step}',
+                model=self.model,
+                template=self.template,
+                max_batch_size=self.args.per_device_eval_batch_size,
+            ),
+            eval_type='swift_custom',
             datasets=self.args.eval_dataset,
             dataset_args=self.args.eval_dataset_args,
             limit=self.args.eval_limit,
             work_dir=os.path.join(self.args.output_dir, 'eval'),
-            eval_batch_size=max_batch_size,
+            eval_batch_size=self.args.per_device_eval_batch_size,
             generation_config=self.args.eval_generation_config or {'max_tokens': 512},
         )
         task_config_kwargs.update(self.args.extra_eval_args or {})
@@ -792,6 +927,8 @@ class SwiftMixin:
     def prepare_logits_to_keep(self, inputs):
         labels = inputs['labels']
         loss_scale = inputs.get('loss_scale')
+        if self.template.sequence_parallel_size > 1:
+            raise NotImplementedError()
         if labels.shape[0] == 1 and not is_mp():
             # device_map may encounter device mismatch issues.
             loss_mask = (labels != -100)[0]
@@ -812,30 +949,15 @@ class SwiftMixin:
 
     def get_cu_seqlens(self, position_ids, logits_to_keep) -> torch.Tensor:
         from swift.llm import get_packed_seq_params
-        cu_seqlens = get_packed_seq_params(position_ids)['cumulative_seqlens_q']
+        cu_seqlens = get_packed_seq_params(position_ids)['cu_seq_lens_q']
         res_cu_seqlens = cu_seqlens.clone()
         if isinstance(logits_to_keep, torch.Tensor):
             for i in range(cu_seqlens.shape[0] - 1):
                 start, end = cu_seqlens[i], cu_seqlens[i + 1]
                 res_cu_seqlens[i + 1:] -= (~logits_to_keep[start:end]).sum()
         elif isinstance(logits_to_keep, int):
-            res_cu_seqlens[1:] -= position_ids.shape[0] + 1 - logits_to_keep
+            res_cu_seqlens[1:] -= position_ids.shape[-1] + 1 - logits_to_keep
         return res_cu_seqlens
-
-    def get_batch_samples(self, *args, **kwargs):
-        res = super().get_batch_samples(*args, **kwargs)
-        from swift.trainers.sequence_parallel import sequence_parallel
-        if (self.template.sequence_parallel_size == 1 or 'Ulysses' == sequence_parallel.__class__.__name__
-                or 'RingAttention' == sequence_parallel.__class__.__name__):
-            # ulysses and ring attention split inputs in the model hook, so no need to gather num_items_in_batch
-            return res
-
-        batch_samples, num_items_in_batch = res
-        if num_items_in_batch is None:
-            num_items_in_batch = torch.tensor(0).to(args[2])
-        from swift.trainers.sequence_parallel import sequence_parallel
-        dist.all_reduce(num_items_in_batch, dist.ReduceOp.SUM, sequence_parallel.sp_group)
-        return batch_samples, num_items_in_batch
 
     @contextmanager
     def _patch_skip_first_batches(self):
@@ -858,12 +980,54 @@ class SwiftMixin:
 
 class DataLoaderMixin:
 
+    def get_sp_dataloader(self, dataset, batch_size, skip_batches=0):
+        from swift.trainers.sequence_parallel import sequence_parallel
+        from swift.trainers.sequence_parallel.utils import SequenceParallelSampler
+        from swift.trainers.sequence_parallel.utils import SequenceParallelDispatcher
+        data_collator = self.data_collator
+        if isinstance(dataset, datasets.Dataset):
+            dataset = self._remove_unused_columns(dataset, description='training')
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description='training')
+        if hasattr(dataset, '__len__'):
+            sampler = SequenceParallelSampler(sequence_parallel, dataset, seed=42)
+            dataloader_params = {
+                'batch_size': batch_size,
+                'collate_fn': data_collator,
+                'num_workers': self.args.dataloader_num_workers,
+                'pin_memory': self.args.dataloader_pin_memory,
+                'persistent_workers': self.args.dataloader_persistent_workers,
+            }
+
+            if not isinstance(dataset, torch.utils.data.IterableDataset):
+                if skip_batches > 0:
+                    from accelerate.data_loader import SkipBatchSampler
+                    sampler = SkipBatchSampler(sampler, skip_batches=skip_batches * batch_size)
+                dataloader_params['sampler'] = sampler
+                dataloader_params['drop_last'] = self.args.dataloader_drop_last
+                dataloader_params['worker_init_fn'] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
+
+            return DataLoaderShard(dataset, device=self.accelerator.device, **dataloader_params)
+        else:
+            dataloader_params = {
+                'collate_fn': data_collator,
+                'num_workers': self.args.dataloader_num_workers,
+                'pin_memory': self.args.dataloader_pin_memory,
+                'persistent_workers': self.args.dataloader_persistent_workers,
+                'prefetch_factor': self.args.dataloader_prefetch_factor
+            }
+            if dist.is_initialized() and dataloader_params['prefetch_factor']:
+                dataloader_params['prefetch_factor'] = dataloader_params['prefetch_factor'] * dist.get_world_size()
+            dataloader = DataLoader(dataset, batch_size=batch_size, **dataloader_params)
+            dataloader = SequenceParallelDispatcher(
+                dataloader, sequence_parallel, self.accelerator.device, skip_batches=skip_batches)
+            return dataloader
+
     def get_train_dataloader(self, skip_batches=0):
         dataloader = None
         if self.template.sequence_parallel_size > 1:
-            from swift.trainers.sequence_parallel import sequence_parallel
-            dataloader = sequence_parallel.get_dataloader(
-                self, self.train_dataset, self._train_batch_size, skip_batches=skip_batches)
+            dataloader = self.get_sp_dataloader(self.train_dataset, self._train_batch_size, skip_batches=skip_batches)
         if dataloader is None:
             # Higher efficiency
             if self.train_dataset is None:
@@ -911,11 +1075,10 @@ class DataLoaderMixin:
     def get_eval_dataloader(self, eval_dataset=None):
         dataloader = None
         if self.template.sequence_parallel_size > 1:
-            from swift.trainers.sequence_parallel import sequence_parallel
             if eval_dataset is None and self.eval_dataset is None:
                 raise ValueError('Trainer: evaluation requires an eval_dataset.')
             eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-            dataloader = sequence_parallel.get_dataloader(self, eval_dataset, self.args.eval_batch_size)
+            dataloader = self.get_sp_dataloader(eval_dataset, self.args.eval_batch_size)
         if dataloader is None:
             return super().get_eval_dataloader(eval_dataset=eval_dataset)
         return dataloader

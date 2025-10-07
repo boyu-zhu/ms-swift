@@ -14,6 +14,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar, Union
 
 import json
+import json_repair
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -368,6 +369,32 @@ def json_parse_to_dict(value: Union[str, Dict, None], strict: bool = True) -> Un
                 value = json.loads(value)
             except json.JSONDecodeError:
                 if strict:
-                    logger.error(f"Unable to parse string: '{value}'")
-                    raise
+                    try:
+                        # fix malformed json string, e.g., incorrect quotation marks
+                        old_value = value
+                        value = json_repair.repair_json(value)
+                        logger.warning(f'Unable to parse json string, try to repair it, '
+                                       f"the string before and after repair are '{old_value}' | '{value}'")
+                        value = json.loads(value)
+                    except Exception:
+                        logger.error(f"Unable to parse json string: '{value}', and try to repair failed")
+                        raise
     return value
+
+
+def remove_response(messages) -> Optional[str]:
+    """
+    Removes and returns the content of the last message if its role is 'assistant'.
+
+    Args:
+        messages (List[Dict]):
+            A list of message dictionaries, each typically containing a 'role' and 'content' key.
+
+    Returns:
+        Optional[str]:
+            The content of the removed 'assistant' message if present;
+            otherwise, returns None. The original messages list is modified in place.
+    """
+    last_role = messages[-1]['role'] if messages else None
+    if last_role == 'assistant':
+        return messages.pop()['content']

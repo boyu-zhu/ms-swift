@@ -30,6 +30,7 @@ try:
     os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '86400'
     import vllm
     from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams, EngineArgs, LLMEngine
+    from vllm.pooling_params import PoolingParams
 except Exception:
     raise
 
@@ -66,6 +67,8 @@ class VllmEngine(InferEngine):
         limit_mm_per_prompt: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
         task_type: Optional[str] = None,  # embedding
+        disable_cascade_attn: bool = False,
+        load_format: str = 'auto',
         # lora
         enable_lora: bool = False,
         max_loras: int = 1,
@@ -78,6 +81,8 @@ class VllmEngine(InferEngine):
         reasoning_parser: Optional[str] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
         template: Optional[Template] = None,
+        num_labels: Optional[int] = None,
+        reranker_use_activation: bool = True,
     ) -> None:
         if engine_kwargs is None:
             engine_kwargs = {}
@@ -90,6 +95,7 @@ class VllmEngine(InferEngine):
             self.default_adapter_request = AdapterRequest('default', adapters[0])
         patch_vllm_memory_leak()
         self.use_async_engine = use_async_engine
+        self.reranker_use_activation = reranker_use_activation
         self.processor = get_model_tokenizer(
             model_id_or_path,
             torch_dtype,
@@ -99,6 +105,7 @@ class VllmEngine(InferEngine):
             use_hf=use_hf,
             hub_token=hub_token,
             revision=revision,
+            num_labels=num_labels,
             task_type=task_type)[1]
         self._post_init(template)
 
@@ -121,6 +128,7 @@ class VllmEngine(InferEngine):
             enable_sleep_mode=enable_sleep_mode,
             quantization=quantization,
             task=task_type,
+            disable_cascade_attn=disable_cascade_attn,
             **engine_kwargs,
         )
         context = nullcontext()
@@ -159,10 +167,16 @@ class VllmEngine(InferEngine):
         distributed_executor_backend: Optional[str] = None,
         enable_sleep_mode: bool = False,
         task: Optional[str] = None,
+        disable_cascade_attn: bool = False,
+        load_format: str = 'auto',
         **engine_kwargs,
     ) -> None:
         if task == 'embedding':
             task = 'embed'
+        elif task == 'seq_cls':
+            task = 'classify'
+        elif task in ('reranker', 'generative_reranker'):
+            task = 'score'
         disable_log_stats = engine_kwargs.pop('disable_log_stats', True)
         if self.use_async_engine:
             engine_cls = AsyncEngineArgs
@@ -182,10 +196,12 @@ class VllmEngine(InferEngine):
             engine_kwargs['limit_mm_per_prompt'] = limit_mm_per_prompt
         else:
             assert not limit_mm_per_prompt, (
-                'The current version of VLLM does not support `limit_mm_per_prompt`. Please upgrade VLLM.')
-        for key in ['enable_expert_parallel', 'enable_sleep_mode']:
+                'The current version of vLLM does not support `limit_mm_per_prompt`. Please upgrade vLLM.')
+        for key in ['enable_expert_parallel', 'enable_sleep_mode', 'disable_cascade_attn', 'load_format']:
             if key in parameters:
                 engine_kwargs[key] = locals()[key]
+            else:
+                logger.warning(f'The current version of vLLM does not support `{key}`. Ignored.')
         for key in ['task', 'seed']:
             val = locals()[key]
             if val is not None:
@@ -196,6 +212,8 @@ class VllmEngine(InferEngine):
         if self.model_meta.model_type in arch_mapping:
             architectures = arch_mapping[self.model_meta.model_type]
             engine_kwargs['hf_overrides'] = {'architectures': architectures}
+        self.default_template.set_mode('vllm')
+        engine_kwargs.update(self.default_template.prepare_engine_kwargs())
         engine_args = engine_cls(
             model=self.model_dir,
             dtype=dtype_mapping[model_info.torch_dtype],
@@ -316,22 +334,33 @@ class VllmEngine(InferEngine):
                 media_data = inputs.get(key) or []
                 if media_data:
                     if self._version_ge('0.6'):
-                        mm_data = {key.rstrip('s'): media_data[0] if len(media_data) == 1 else media_data}
+                        mm_data[key.rstrip('s')] = media_data[0] if len(media_data) == 1 else media_data
                     else:
                         assert len(media_data) == 1, (
                             f'The current version of vllm only supports single {key}. Please upgrade to vllm >= 0.6.0')
-                        mm_data = {key.rstrip('s'): media_data[0]}
+                        mm_data[key.rstrip('s')] = media_data[0]
             if mm_data:
                 llm_inputs['multi_modal_data'] = mm_data
             mm_processor_kwargs = inputs.get('mm_processor_kwargs')
             if mm_processor_kwargs:
                 llm_inputs['mm_processor_kwargs'] = mm_processor_kwargs
-            if self.task_type == 'embedding':
-                from vllm.pooling_params import PoolingParams
-                if 'task' in inspect.signature(PoolingParams).parameters:
-                    pooling_params = PoolingParams(task='embed')
-                else:
-                    pooling_params = PoolingParams()
+
+            has_task_arg = 'task' in inspect.signature(PoolingParams).parameters
+            has_activation_arg = 'activation' in inspect.signature(PoolingParams).parameters
+            task_mapping = {
+                'embedding': 'embed',
+                'seq_cls': 'classify',
+                'reranker': 'score',
+                'generative_reranker': 'score',
+            }
+            if self.task_type in task_mapping:
+                pooling_kwargs = {}
+                if has_task_arg:
+                    pooling_kwargs['task'] = task_mapping[self.task_type]
+                if self.task_type in ('reranker', 'generative_reranker') and \
+                        has_activation_arg and self.reranker_use_activation:
+                    pooling_kwargs['activation'] = True
+                pooling_params = PoolingParams(**pooling_kwargs)
                 return self.engine.encode(llm_inputs, pooling_params, request_id)
             elif self.use_async_engine:
                 return self.engine.generate(llm_inputs, generation_config, request_id, **kwargs)
@@ -542,6 +571,44 @@ class VllmEngine(InferEngine):
             prompt_token_ids=prompt_token_ids,
             images_size=images_size)
 
+    def _create_seq_cls_response(
+        self,
+        result,
+        template,
+        request_config,
+        request_id,
+    ) -> ChatCompletionResponse:
+        assert result is not None
+        choices = []
+        preds = result.outputs.data
+        if preds.dim() == 1:
+            preds = preds.unsqueeze(0)
+        if self.task_type == 'seq_cls':
+            top_logprobs = request_config.top_logprobs or 20
+            preds, logprobs = template.decode_seq_cls(preds, top_logprobs)
+        else:
+            logprobs = [None] * len(preds)
+        num_prompt_token_ids = 0
+        num_generated_tokens = 0
+        for i, pred in enumerate(preds):
+            num_prompt_token_ids += len(result.prompt_token_ids)
+            num_generated_tokens += 1
+            if isinstance(pred, torch.Tensor):
+                pred = pred.tolist()
+            choices.append(
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role='assistant', content=pred, tool_calls=None),
+                    finish_reason='stop',
+                    logprobs=logprobs[i]))
+        usage_info = self._get_usage_info(num_prompt_token_ids, num_generated_tokens)
+        return ChatCompletionResponse(
+            model=self.model_name,
+            choices=choices,
+            usage=usage_info,
+            id=request_id,
+            prompt_token_ids=result.prompt_token_ids)
+
     async def _infer_full_async(
         self,
         template: Template,
@@ -549,14 +616,18 @@ class VllmEngine(InferEngine):
         generation_config: SamplingParams,
         adapter_request: Optional[AdapterRequest],
         request_config: RequestConfig,
+        request_id: Optional[str] = None,
     ) -> Union[ChatCompletionResponse, EmbeddingResponse]:
-        request_id = random_uuid()
+        if request_id is None:
+            request_id = random_uuid()
         result_generator = self._add_request(inputs, generation_config, request_id, adapter_request=adapter_request)
         result = None
         async for result in result_generator:
             pass
         if self.task_type == 'embedding':
             return self._create_embedding_response(result, template, generation_config, request_id)
+        elif self.task_type in ('seq_cls', 'reranker', 'generative_reranker'):
+            return self._create_seq_cls_response(result, template, request_config, request_id)
         else:
             return self._create_chat_completion_response(result, inputs, template, request_config, request_id)
 
@@ -678,6 +749,9 @@ class VllmEngine(InferEngine):
             'adapter_request': adapter_request,
             'request_config': request_config,
         }
+        if hasattr(infer_request, 'uuid') and infer_request.uuid:
+            # RolloutInferRequest
+            kwargs.update({'request_id': infer_request.uuid})
         if pre_infer_hook:
             kwargs = pre_infer_hook(kwargs)
         if request_config.stream:
@@ -688,6 +762,8 @@ class VllmEngine(InferEngine):
     @staticmethod
     def patch_remove_log():
         from vllm.engine import async_llm_engine
+        if not hasattr(async_llm_engine, '_log_task_completion'):
+            return
 
         async_llm_engine._origin_log_task_completion = async_llm_engine._log_task_completion
 

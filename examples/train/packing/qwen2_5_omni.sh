@@ -9,16 +9,11 @@ VIDEO_MAX_PIXELS=50176 \
 FPS_MAX_FRAMES=12 \
 MAX_PIXELS=1003520 \
 swift sft \
-    --model omni \
-    --dataset 'finetune/beavertails_dataset.jsonl' \
-              'finetune/dssass.jsonl' \
-              'finetune/fakett.jsonl' \
-              'finetune/llava.json' \
-              'finetune/safesora.json' \
-              'finetune/tikharm.jsonl' \
-              'finetune/toxic_chat_dataset.jsonl' \
-              'finetune/unsafebench.json' \
-              'finetune/vlguard.jsonl' \
+    --model Qwen/Qwen2.5-Omni-7B \
+    --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#10000' \
+              'AI-ModelScope/LaTeX_OCR#2000' \
+              'speech_asr/speech_asr_aishell1_trainsets:validation#2000' \
+    --load_from_cache_file true \
     --split_dataset_ratio 0.01 \
     --train_type full \
     --attn_impl flash_attn \
