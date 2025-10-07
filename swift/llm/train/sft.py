@@ -48,7 +48,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             from swift.trainers.sequence_parallel import sequence_parallel
             sequence_parallel.init_sequence_parallel(args.sequence_parallel_size)
         self.model, self.processor = args.get_model_processor(load_model=load_model)
-        if self.model is None:
+        if self.model is None: 
             return
         if hasattr(self.model, 'hf_device_map'):
             logger.info(f'model.hf_device_map: {self.model.hf_device_map}')
@@ -205,7 +205,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             state.last_model_checkpoint = None
         logger.info(f'last_model_checkpoint: {state.last_model_checkpoint}')
         logger.info(f'best_model_checkpoint: {state.best_model_checkpoint}')
-
+        with open("best_ckpt_path.txt", "w") as f:
+            f.write(state.best_model_checkpoint)
         # Visualization
         if is_master():
             if 'tensorboard' in training_args.report_to:
